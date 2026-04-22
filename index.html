@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>飲食控制中心</title>
+  
+  <!-- iOS / PWA 專屬設定，讓網頁看起來像原生 App -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="飲食控制">
+  <meta name="theme-color" content="#f8fafc">
+  <!-- PWA Manifest -->
+  <link rel="manifest" href='data:application/manifest+json,{"name":"飲食控制中心","short_name":"飲食控制","display":"standalone","background_color":"#f8fafc","theme_color":"#f8fafc"}'>
+  <!-- App 圖示 (此處使用一個暫代的蘋果形狀健康圖示，您可以之後換成自己喜歡的圖片網址) -->
+  <link rel="apple-touch-icon" href="https://upload.wikimedia.org/wikipedia/commons/thumb/e/e1/Apple_Health_icon.png/512px-Apple_Health_icon.png">
+  
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- Babel Standalone (用於在瀏覽器中編譯 JSX) -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- 定義 ES 模組的 CDN 來源 -->
+  <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.2.0",
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+        "lucide-react": "https://esm.sh/lucide-react@0.292.0?external=react",
+        "firebase/app": "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js",
+        "firebase/auth": "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js",
+        "firebase/firestore": "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js"
+      }
+    }
+  </script>
+</head>
+<body class="bg-slate-50 text-slate-900 antialiased overflow-hidden">
+  
+  <!-- React 應用程式的掛載點 -->
+  <div id="root" class="h-screen w-full"></div>
+
+  <!-- 應用程式邏輯 -->
+  <script type="text/babel" data-type="module">
+    import React, { useState, useEffect, useRef } from 'react';
+    import { createRoot } from 'react-dom/client';
+    import { Camera, Droplets, Flame, User, Home, Plus, Activity, Check, AlertCircle, RefreshCw, ChevronLeft, ChevronRight } from 'lucide-react';
+    import { initializeApp } from 'firebase/app';
+    import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+    import { getFirestore, doc, setDoc, onSnapshot } from 'firebase/firestore';
+
+    // --- 環境變數與 Firebase 初始化 ---
+    const API_KEY = ""; 
+    const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${API_KEY}`;
+
+    const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    const initToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+    let app, auth, db;
+    try {
+      app = initializeApp(firebaseConfig);
+      auth = getAuth(app);
+      db = getFirestore(app);
+    } catch (e) {
+      console.error("Firebase 初始化失敗", e);
+    }
+
+    // 取得今天日期的 YYYY-MM-DD 格式
+    const getTodayString = () => {
+      const d = new Date();
+      // 修正時區偏移，確保取得當地時間的正確日期
+      return new Date(d.getTime() - (d.getTimezoneOffset() * 60000)).toISOString().split('T')[0];
+    };
+
+    function App() {
+      // --- 系統狀態 ---
+      const [user, setUser] = useState(null);
+      const [activeTab, setActiveTab] = useState('dashboard');
+      const [currentDate, setCurrentDate] = useState(getTodayString());
+      const [isLoading, setIsLoading] = useState(true);
+      
+      // 個人資料與目標
+      const [profile, setProfile] = useState({ height: '', weight: '', age: '', gender: 'male', activityLevel: '1.2' });
+      const [targets, setTargets] = useState({ calories: 1800, protein: 135, carbs: 189, fat: 56, sugar: 50 });
+
+      // 每日紀錄 (依照 currentDate 變動)
+      const [foodLogs, setFoodLogs] = useState([]);
+      const [waterIntake, setWaterIntake] = useState(0);
+      const [exerciseLogs, setExerciseLogs] = useState([]);
+      const [dailyWeight, setDailyWeight] = useState(''); // 新增每日體重
+
+      // UI 切換狀態
+      const [foodInputMode, setFoodInputMode] = useState('camera'); // 'camera' 或 'manual'
+      const [exerciseInputMode, setExerciseInputMode] = useState('custom'); // 'custom', 'steps', 'weightlifting'
+
+      // API 狀態
+      const [isAnalyzing, setIsAnalyzing] = useState(false);
+      const [analysisResult, setAnalysisResult] = useState(null);
+      const [errorMsg, setErrorMsg] = useState('');
+      const fileInputRef = useRef(null);
+
+      // --- 1. Firebase 身份驗證 (Auth BEFORE Queries) ---
+      useEffect(() => {
+        if (!auth) return;
+        const initAuth = async () => {
+          try {
+            if (initToken) {
+              await signInWithCustomToken(auth, initToken);
+            } else {
+              await signInAnonymously(auth);
+            }
+          } catch (err) {
+            console.error("驗證錯誤:", err);
+          }
+        };
+        initAuth();
+        
+        const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+          setUser(currentUser);
+          if (!currentUser) setIsLoading(false);
+        });
+        return () => unsubscribe();
+      }, []);
+
+      // --- 2. 監聽全域使用者設定 (Profile & Targets) ---
+      useEffect(() => {
+        if (!user || !db) return;
+        const profileRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'profile');
+        
+        const unsub = onSnapshot(profileRef, (docSnap) => {
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            if (data.profile) setProfile(data.profile);
+            if (data.targets) setTargets(data.targets);
+          }
+        }, (err) => console.error("設定讀取失敗:", err));
+        
+        return () => unsub();
+      }, [user]);
+
+      // --- 3. 監聽當前日期的每日紀錄 (Daily Logs) ---
+      useEffect(() => {
+        if (!user || !db) return;
+        setIsLoading(true);
+        
+        const dailyRef = doc(db, 'artifacts', appId, 'users', user.uid, 'dailyLogs', currentDate);
+        
+        const unsub = onSnapshot(dailyRef, (docSnap) => {
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            setFoodLogs(data.foodLogs || []);
+            setWaterIntake(data.waterIntake || 0);
+            setExerciseLogs(data.exerciseLogs || []);
+            setDailyWeight(data.dailyWeight || '');
+          } else {
+            // 當日尚無紀錄，初始化為空
+            setFoodLogs([]);
+            setWaterIntake(0);
+            setExerciseLogs([]);
+            setDailyWeight('');
+          }
+          setIsLoading(false);
+        }, (err) => {
+          console.error("紀錄讀取失敗:", err);
+          setIsLoading(false);
+        });
+        
+        return () => unsub();
+      }, [user, currentDate]);
+
+      // --- 資料寫入輔助函式 ---
+      const saveDailyData = async (updates) => {
+        if (!user || !db) return;
+        const dailyRef = doc(db, 'artifacts', appId, 'users', user.uid, 'dailyLogs', currentDate);
+        try {
+          await setDoc(dailyRef, updates, { merge: true });
+        } catch (err) {
+          console.error("資料儲存失敗:", err);
+        }
+      };
+
+      const saveSettings = async (newProfile, newTargets) => {
+        if (!user || !db) return;
+        const profileRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'profile');
+        try {
+          await setDoc(profileRef, { profile: newProfile, targets: newTargets }, { merge: true });
+        } catch (err) {
+          console.error("設定儲存失敗:", err);
+        }
+      };
+
+      // --- 核心邏輯：計算 TDEE 與營養素 ---
+      const calculateTargets = (e) => {
+        if (e) e.preventDefault();
+        const { height, weight, age, gender, activityLevel } = profile;
+        
+        if (!height || !weight || !age) {
+          alert('請填寫完整資料');
+          return;
+        }
+
+        // Mifflin-St Jeor 方程式
+        let bmr = (10 * parseFloat(weight)) + (6.25 * parseFloat(height)) - (5 * parseInt(age));
+        bmr = gender === 'male' ? bmr + 5 : bmr - 161;
+        const tdee = Math.round(bmr * parseFloat(activityLevel));
+        
+        const newTargets = {
+          calories: tdee,
+          protein: Math.round((tdee * 0.30) / 4),
+          fat: Math.round((tdee * 0.25) / 9),
+          carbs: Math.round((tdee * 0.45) / 4),
+          sugar: 50 // 預設糖分上限
+        };
+
+        setTargets(newTargets);
+        saveSettings(profile, newTargets);
+        setActiveTab('dashboard');
+      };
+
+      // --- 日期切換邏輯 ---
+      const changeDate = (daysToAdd) => {
+        const d = new Date(currentDate);
+        d.setDate(d.getDate() + daysToAdd);
+        setCurrentDate(d.toISOString().split('T')[0]);
+      };
+
+      // --- Gemini 圖片分析 ---
+      const handleImageUpload = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          analyzeFoodWithGemini(reader.result);
+        };
+        reader.readAsDataURL(file);
+      };
+
+      const analyzeFoodWithGemini = async (base64Image) => {
+        setIsAnalyzing(true);
+        setErrorMsg('');
+        setAnalysisResult(null);
+
+        const base64Content = base64Image.split(',')[1];
+        const mimeType = base64Image.split(';')[0].split(':')[1];
+
+        const promptText = `
+          You are an expert nutritionist. Analyze the food in this image.
+          Identify the food and estimate its nutritional values for the entire portion shown.
+          Respond ONLY with a valid JSON object in the exact following format, without any markdown formatting or code blocks:
+          {
+            "name": "Food Name in Traditional Chinese",
+            "calories": number (in kcal),
+            "protein": number (in grams),
+            "carbs": number (in grams),
+            "fat": number (in grams),
+            "sugar": number (in grams)
+          }
+        `;
+
+        const payload = {
+          contents: [{ parts: [{ text: promptText }, { inlineData: { mimeType, data: base64Content } }] }]
+        };
+
+        const maxRetries = 3;
+        let attempt = 0;
+        
+        while (attempt < maxRetries) {
+          try {
+            const response = await fetch(GEMINI_API_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) throw new Error(`API: ${response.status}`);
+            
+            const data = await response.json();
+            let textResult = data.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!textResult) throw new Error('No result');
+
+            textResult = textResult.replace(/```json/g, '').replace(/```/g, '').trim();
+            const parsedData = JSON.parse(textResult);
+            setAnalysisResult({ ...parsedData, id: Date.now() });
+            break;
+          } catch (err) {
+            attempt++;
+            if (attempt >= maxRetries) {
+              setErrorMsg('無法分析圖片，請確保圖片清晰並包含食物。');
+              setAnalysisResult({ name: '無法辨識食物', calories: 0, protein: 0, carbs: 0, fat: 0, sugar: 0, id: Date.now(), isManual: true });
+            } else {
+              await new Promise(r => setTimeout(r, Math.pow(2, attempt - 1) * 1000));
+            }
+          }
+        }
+        setIsAnalyzing(false);
+      };
+
+      // --- 寫入當日紀錄 ---
+      const confirmAddFood = () => {
+        if (analysisResult) {
+          const updatedLogs = [analysisResult, ...foodLogs];
+          setFoodLogs(updatedLogs); // Optimistic Update
+          saveDailyData({ foodLogs: updatedLogs });
+          setAnalysisResult(null);
+          setActiveTab('dashboard');
+        }
+      };
+
+      const handleUpdateWater = (amount) => {
+        const newAmount = amount === 0 ? 0 : waterIntake + amount;
+        setWaterIntake(newAmount);
+        saveDailyData({ waterIntake: newAmount });
+      };
+
+      const handleDeleteFood = (id) => {
+        const updatedLogs = foodLogs.filter(log => log.id !== id);
+        setFoodLogs(updatedLogs);
+        saveDailyData({ foodLogs: updatedLogs });
+      };
+
+      const handleDeleteExercise = (id) => {
+        const updatedLogs = exerciseLogs.filter(log => log.id !== id);
+        setExerciseLogs(updatedLogs);
+        saveDailyData({ exerciseLogs: updatedLogs });
+      };
+
+      const handleUpdateWeight = (val) => {
+        setDailyWeight(val);
+        saveDailyData({ dailyWeight: val });
+        // 同步更新 profile 體重
+        const newProfile = { ...profile, weight: val };
+        setProfile(newProfile);
+        saveSettings(newProfile, targets);
+      };
+
+      const handleManualFoodAdd = (e) => {
+        e.preventDefault();
+        const form = e.target;
+        const newLog = {
+          name: form.foodName.value,
+          calories: Number(form.calories.value),
+          protein: Number(form.protein.value || 0),
+          carbs: Number(form.carbs.value || 0),
+          fat: Number(form.fat.value || 0),
+          sugar: Number(form.sugar.value || 0),
+          id: Date.now()
+        };
+        const updatedLogs = [newLog, ...foodLogs];
+        setFoodLogs(updatedLogs);
+        saveDailyData({ foodLogs: updatedLogs });
+        form.reset();
+        setActiveTab('dashboard');
+      };
+
+      const handleAddExercise = (e) => {
+        e.preventDefault();
+        const form = e.target;
+        let name = '';
+        let cals = 0;
+
+        if (exerciseInputMode === 'custom') {
+          name = form.exerciseName.value;
+          cals = parseInt(form.exerciseCals.value);
+        } else if (exerciseInputMode === 'steps') {
+          const steps = parseInt(form.stepsCount.value);
+          name = `步行 ${steps} 步`;
+          cals = Math.round(steps * 0.04);
+        } else if (exerciseInputMode === 'weightlifting') {
+          const mins = parseInt(form.weightMins.value);
+          name = `重量訓練 ${mins} 分鐘`;
+          cals = Math.round(mins * 4);
+        }
+
+        if (!name || !cals) return;
+        
+        const updatedLogs = [{ name, calories: cals, id: Date.now() }, ...exerciseLogs];
+        setExerciseLogs(updatedLogs);
+        saveDailyData({ exerciseLogs: updatedLogs });
+        form.reset();
+      };
+
+      // --- 計算當日總結 ---
+      const currentStats = {
+        calories: foodLogs.reduce((acc, curr) => acc + Number(curr.calories || 0), 0),
+        protein: foodLogs.reduce((acc, curr) => acc + Number(curr.protein || 0), 0),
+        carbs: foodLogs.reduce((acc, curr) => acc + Number(curr.carbs || 0), 0),
+        fat: foodLogs.reduce((acc, curr) => acc + Number(curr.fat || 0), 0),
+        sugar: foodLogs.reduce((acc, curr) => acc + Number(curr.sugar || 0), 0),
+        exerciseBurned: exerciseLogs.reduce((acc, curr) => acc + Number(curr.calories || 0), 0)
+      };
+
+      const netCalories = currentStats.calories - currentStats.exerciseBurned;
+
+      // --- UI 元件 ---
+      const ProgressBar = ({ label, current, target, unit, colorClass }) => {
+        const percentage = target > 0 ? Math.min(100, (current / target) * 100) : 0;
+        return (
+          <div className="mb-4">
+            <div className="flex justify-between text-sm mb-1 text-slate-700 font-medium">
+              <span>{label}</span>
+              <span>{current} / {target} {unit}</span>
+            </div>
+            <div className="w-full bg-slate-200 rounded-full h-2.5">
+              <div className={`h-2.5 rounded-full ${colorClass} transition-all duration-500`} style={{ width: `${percentage}%` }}></div>
+            </div>
+          </div>
+        );
+      };
+
+      // --- 畫面渲染分支 ---
+      if (isLoading) {
+        return (
+          <div className="w-full max-w-md mx-auto min-h-screen flex flex-col items-center justify-center bg-slate-50">
+            <RefreshCw className="w-10 h-10 text-blue-500 animate-spin mb-4" />
+            <p className="text-slate-500 font-medium">正在讀取雲端資料...</p>
+          </div>
+        );
+      }
+
+      return (
+        <div className="w-full max-w-md mx-auto bg-slate-50 h-screen relative font-sans shadow-2xl overflow-hidden flex flex-col">
+          {/* 頂部導航/時光機 (僅在部分頁面顯示) */}
+          {['dashboard', 'water', 'exercise'].includes(activeTab) && (
+            <div className="bg-white border-b border-slate-200 px-4 py-3 flex justify-between items-center shadow-sm z-10 flex-shrink-0">
+              <button onClick={() => changeDate(-1)} className="p-2 hover:bg-slate-100 rounded-lg text-slate-600 transition-colors">
+                <ChevronLeft className="w-5 h-5"/>
+              </button>
+              <div className="text-center">
+                <div className="text-xs text-slate-400 font-medium">正在查看記錄</div>
+                <div className="font-bold text-slate-800">
+                  {currentDate === getTodayString() ? '今天' : currentDate}
+                </div>
+              </div>
+              <button 
+                onClick={() => changeDate(1)} 
+                disabled={currentDate === getTodayString()}
+                className={`p-2 rounded-lg transition-colors ${currentDate === getTodayString() ? 'text-slate-300' : 'text-slate-600 hover:bg-slate-100'}`}
+              >
+                <ChevronRight className="w-5 h-5"/>
+              </button>
+            </div>
+          )}
+
+          {/* 內容區域 */}
+          <div className="flex-1 overflow-y-auto w-full">
+            {activeTab === 'dashboard' && (
+              <div className="p-4 pb-24 space-y-6">
+                {/* 總熱量卡片 */}
+                <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 relative overflow-hidden">
+                  <div className="absolute top-0 right-0 p-4 opacity-5"><Activity className="w-24 h-24" /></div>
+                  <div className="flex justify-between items-center mb-4 relative z-10">
+                    <h3 className="font-semibold text-slate-800 flex items-center">淨熱量</h3>
+                    <span className="text-sm text-slate-500 bg-slate-100 px-2 py-1 rounded-md">目標: {targets.calories} kcal</span>
+                  </div>
+                  <div className="flex items-end gap-2 mb-4 relative z-10">
+                    <span className="text-5xl font-extrabold text-slate-900 tracking-tight">{netCalories}</span>
+                    <span className="text-slate-500 pb-1 font-medium">kcal</span>
+                  </div>
+                  <div className="flex text-sm font-medium text-slate-600 gap-6 relative z-10">
+                    <div className="bg-slate-50 px-3 py-2 rounded-lg border border-slate-100">攝取 <span className="text-blue-600 font-bold ml-1">{currentStats.calories}</span></div>
+                    <div className="bg-slate-50 px-3 py-2 rounded-lg border border-slate-100">消耗 <span className="text-orange-500 font-bold ml-1">{currentStats.exerciseBurned}</span></div>
+                  </div>
+                </div>
+
+                {/* 宏量營養素 */}
+                <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+                  <h3 className="font-semibold text-slate-800 mb-5">營養控制</h3>
+                  <ProgressBar label="蛋白質" current={currentStats.protein} target={targets.protein} unit="g" colorClass="bg-blue-500" />
+                  <ProgressBar label="碳水化合物" current={currentStats.carbs} target={targets.carbs} unit="g" colorClass="bg-amber-500" />
+                  <ProgressBar label="脂肪" current={currentStats.fat} target={targets.fat} unit="g" colorClass="bg-rose-500" />
+                  <ProgressBar label="糖分 (建議上限)" current={currentStats.sugar} target={targets.sugar} unit="g" colorClass="bg-purple-500" />
+                </div>
+
+                {/* 快捷紀錄儀表 */}
+                <div className="grid grid-cols-2 gap-4">
+                  <div onClick={() => setActiveTab('water')} className="bg-blue-50 rounded-2xl p-5 flex flex-col items-center justify-center cursor-pointer border border-blue-100 hover:bg-blue-100 transition-colors">
+                    <Droplets className="w-8 h-8 text-blue-500 mb-2" />
+                    <span className="font-bold text-blue-900 text-lg">{waterIntake} ml</span>
+                  </div>
+                  <div onClick={() => setActiveTab('exercise')} className="bg-orange-50 rounded-2xl p-5 flex flex-col items-center justify-center cursor-pointer border border-orange-100 hover:bg-orange-100 transition-colors">
+                    <Flame className="w-8 h-8 text-orange-500 mb-2" />
+                    <span className="font-bold text-orange-900 text-lg">{currentStats.exerciseBurned} kcal</span>
+                  </div>
+                </div>
+
+                {/* 體重紀錄 */}
+                <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 flex justify-between items-center mt-4">
+                  <div>
+                    <h3 className="font-semibold text-slate-800">今日體重</h3>
+                    <span className="text-xs text-slate-500">同步更新個人設定</span>
+                  </div>
+                  <div className="flex items-center">
+                    <input 
+                      type="number" 
+                      value={dailyWeight} 
+                      onChange={(e) => handleUpdateWeight(e.target.value)}
+                      placeholder="輸入體重"
+                      className="w-24 p-2 bg-slate-50 border border-slate-200 rounded-lg text-right outline-none focus:ring-2 focus:ring-blue-500 font-bold text-slate-700"
+                    />
+                    <span className="ml-2 text-slate-500 font-medium">kg</span>
+                  </div>
+                </div>
+                
+                {/* 飲食列表 */}
+                {foodLogs.length > 0 && (
+                  <div className="mt-6">
+                    <h3 className="font-semibold text-slate-800 mb-3 px-1">本日志錄</h3>
+                    <div className="space-y-3">
+                      {foodLogs.map(log => (
+                        <div key={log.id} className="bg-white p-4 rounded-2xl border border-slate-100 flex justify-between items-center shadow-sm">
+                          <div className="flex-1">
+                            <div className="font-bold text-slate-800 mb-1">{log.name}</div>
+                            <div className="flex gap-2 text-[10px] font-medium text-slate-500">
+                              <span className="bg-blue-50 text-blue-600 px-1.5 py-0.5 rounded">P: {log.protein}</span>
+                              <span className="bg-amber-50 text-amber-600 px-1.5 py-0.5 rounded">C: {log.carbs}</span>
+                              <span className="bg-rose-50 text-rose-600 px-1.5 py-0.5 rounded">F: {log.fat}</span>
+                              <span className="bg-purple-50 text-purple-600 px-1.5 py-0.5 rounded">糖: {log.sugar || 0}</span>
+                            </div>
+                          </div>
+                          <div className="flex flex-col items-end ml-3">
+                            <span className="font-bold text-slate-900">{log.calories} kcal</span>
+                            <button onClick={() => handleDeleteFood(log.id)} className="text-[10px] text-red-400 mt-1 hover:underline">刪除</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {activeTab === 'profile' && (
+              <div className="p-4 pb-24">
+                <h1 className="text-2xl font-bold text-slate-900 mb-6">全域設定</h1>
+                <form onSubmit={calculateTargets} className="space-y-4 bg-white p-5 rounded-2xl shadow-sm border border-slate-100">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-1">性別</label>
+                      <select value={profile.gender} onChange={(e) => setProfile({...profile, gender: e.target.value})} className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none">
+                        <option value="male">男性</option>
+                        <option value="female">女性</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-1">年齡</label>
+                      <input type="number" value={profile.age} onChange={(e) => setProfile({...profile, age: e.target.value})} className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500" required />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-1">身高 (cm)</label>
+                      <input type="number" value={profile.height} onChange={(e) => setProfile({...profile, height: e.target.value})} className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500" required />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-1">體重 (kg)</label>
+                      <input type="number" value={profile.weight} onChange={(e) => setProfile({...profile, weight: e.target.value})} className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500" required />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1">活動量</label>
+                    <select value={profile.activityLevel} onChange={(e) => setProfile({...profile, activityLevel: e.target.value})} className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500">
+                      <option value="1.2">久坐</option>
+                      <option value="1.375">輕度</option>
+                      <option value="1.55">中度</option>
+                      <option value="1.725">高度</option>
+                      <option value="1.9">極度</option>
+                    </select>
+                  </div>
+                  <button type="submit" className="w-full bg-slate-900 text-white font-bold py-3.5 rounded-xl mt-4 active:scale-95 transition-transform">
+                    儲存並重新計算目標
+                  </button>
+                </form>
+                
+                <div className="mt-6 text-xs text-slate-400 text-center">
+                  使用您的專屬 ID: {user?.uid.substring(0,8)}... 備份雲端資料
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'food' && (
+              <div className="p-4 pb-24 h-full flex flex-col">
+                <h1 className="text-2xl font-bold text-slate-900 mb-6">新增紀錄至 {currentDate}</h1>
+                
+                {/* 模式切換 */}
+                <div className="flex bg-slate-200 p-1 rounded-xl mb-6">
+                  <button 
+                    onClick={() => setFoodInputMode('camera')}
+                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-colors ${foodInputMode === 'camera' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                  >拍照辨識</button>
+                  <button 
+                    onClick={() => setFoodInputMode('manual')}
+                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-colors ${foodInputMode === 'manual' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                  >手動輸入</button>
+                </div>
+
+                {foodInputMode === 'camera' ? (
+                  <>
+                    {!analysisResult && !isAnalyzing && (
+                      <div className="flex-1 flex flex-col items-center justify-center">
+                        <input type="file" accept="image/*" capture="environment" className="hidden" ref={fileInputRef} onChange={handleImageUpload} />
+                        <button onClick={() => fileInputRef.current?.click()} className="w-48 h-48 bg-white shadow-sm rounded-full border-4 border-dashed border-slate-300 flex flex-col items-center justify-center text-slate-500 hover:border-blue-500 hover:text-blue-500 transition-colors">
+                          <Camera className="w-12 h-12 mb-2" />
+                          <span className="font-medium">拍照辨識食物</span>
+                        </button>
+                      </div>
+                    )}
+
+                    {isAnalyzing && (
+                      <div className="flex-1 flex flex-col items-center justify-center">
+                        <RefreshCw className="w-12 h-12 text-blue-500 animate-spin mb-4" />
+                        <h3 className="text-lg font-bold text-slate-800">AI 正在萃取營養素...</h3>
+                      </div>
+                    )}
+
+                    {errorMsg && (
+                      <div className="bg-red-50 p-4 rounded-xl mb-4 flex items-start border border-red-100">
+                        <AlertCircle className="w-5 h-5 text-red-500 mr-2 flex-shrink-0 mt-0.5" />
+                        <p className="text-red-700 text-sm">{errorMsg}</p>
+                      </div>
+                    )}
+
+                    {analysisResult && (
+                      <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm mt-4">
+                        <h2 className="text-xl font-bold text-slate-800 mb-4 border-b pb-3">{analysisResult.name}</h2>
+                        <div className="grid grid-cols-2 gap-3 mb-6">
+                          <div className="bg-slate-50 p-3 rounded-xl text-center"><span className="block text-slate-500 text-xs mb-1">熱量</span><span className="font-bold text-xl">{analysisResult.calories}</span></div>
+                          <div className="bg-blue-50 p-3 rounded-xl text-center"><span className="block text-blue-600 text-xs mb-1">蛋白質</span><span className="font-bold text-xl text-blue-900">{analysisResult.protein}</span></div>
+                          <div className="bg-amber-50 p-3 rounded-xl text-center"><span className="block text-amber-600 text-xs mb-1">碳水</span><span className="font-bold text-xl text-amber-900">{analysisResult.carbs}</span></div>
+                          <div className="bg-rose-50 p-3 rounded-xl text-center"><span className="block text-rose-600 text-xs mb-1">脂肪</span><span className="font-bold text-xl text-rose-900">{analysisResult.fat}</span></div>
+                          <div className="bg-purple-50 p-3 rounded-xl text-center col-span-2"><span className="block text-purple-600 text-xs mb-1">糖分</span><span className="font-bold text-xl text-purple-900">{analysisResult.sugar || 0}</span></div>
+                        </div>
+                        <div className="flex gap-3">
+                          <button onClick={() => setAnalysisResult(null)} className="flex-1 py-3 bg-slate-100 text-slate-700 font-bold rounded-xl">重拍</button>
+                          <button onClick={confirmAddFood} className="flex-1 py-3 bg-blue-600 text-white font-bold rounded-xl flex items-center justify-center shadow-lg"><Check className="w-5 h-5 mr-1" /> 確認存檔</button>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <form onSubmit={handleManualFoodAdd} className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm mt-2">
+                    <div className="space-y-4">
+                      <div><label className="block text-xs text-slate-500 mb-1">食物名稱 *</label><input name="foodName" type="text" className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500" required /></div>
+                      <div className="grid grid-cols-2 gap-4">
+                        <div><label className="block text-xs text-slate-500 mb-1">熱量 (kcal) *</label><input name="calories" type="number" className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500" required /></div>
+                        <div><label className="block text-xs text-blue-500 mb-1">蛋白質 (g)</label><input name="protein" type="number" step="0.1" className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500" /></div>
+                        <div><label className="block text-xs text-amber-500 mb-1">碳水 (g)</label><input name="carbs" type="number" step="0.1" className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500" /></div>
+                        <div><label className="block text-xs text-rose-500 mb-1">脂肪 (g)</label><input name="fat" type="number" step="0.1" className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500" /></div>
+                        <div className="col-span-2"><label className="block text-xs text-purple-500 mb-1">糖分 (g)</label><input name="sugar" type="number" step="0.1" className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500" /></div>
+                      </div>
+                      <button type="submit" className="w-full py-3 mt-4 bg-slate-900 text-white font-bold rounded-xl active:scale-95 transition-transform shadow-md">儲存紀錄</button>
+                    </div>
+                  </form>
+                )}
+              </div>
+            )}
+
+            {activeTab === 'water' && (
+              <div className="p-4 pb-24 h-full flex flex-col items-center pt-12">
+                <div className="w-56 h-56 rounded-full border-8 border-blue-50 flex flex-col items-center justify-center relative mb-10 shadow-inner bg-white overflow-hidden">
+                  <div 
+                    className="absolute bottom-0 left-0 right-0 bg-blue-200/50 transition-all duration-1000 ease-in-out z-0"
+                    style={{ height: `${Math.min(100, (waterIntake / 2000) * 100)}%` }}
+                  />
+                  <Droplets className="w-10 h-10 text-blue-500 mb-2 relative z-10" />
+                  <span className="text-4xl font-extrabold text-blue-900 tracking-tight relative z-10">{waterIntake}</span>
+                  <span className="text-slate-500 font-medium text-sm mt-1 relative z-10">毫升 (ml)</span>
+                </div>
+
+                <div className="w-full max-w-xs space-y-4">
+                  <button onClick={() => handleUpdateWater(250)} className="w-full py-4 bg-blue-500 text-white font-bold rounded-2xl flex items-center justify-center shadow-md active:scale-95 transition-transform">
+                    <Plus className="w-5 h-5 mr-2" /> 喝了一杯 (250ml)
+                  </button>
+                  <button onClick={() => handleUpdateWater(500)} className="w-full py-4 bg-blue-100 text-blue-700 font-bold rounded-2xl flex items-center justify-center active:scale-95 transition-transform">
+                    <Plus className="w-5 h-5 mr-2" /> 喝了一瓶 (500ml)
+                  </button>
+                  <button onClick={() => handleUpdateWater(-waterIntake)} className="w-full py-2 text-slate-400 font-medium text-sm underline mt-6">
+                    歸零重新計算
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'exercise' && (
+              <div className="p-4 pb-24">
+                <div className="bg-orange-50 rounded-3xl p-8 mb-6 text-center border border-orange-100 shadow-sm">
+                  <Flame className="w-12 h-12 text-orange-500 mx-auto mb-3" />
+                  <h2 className="text-slate-500 font-medium mb-1">當日消耗總計</h2>
+                  <div className="text-5xl font-extrabold text-orange-600 tracking-tight">
+                    {currentStats.exerciseBurned} <span className="text-lg font-normal text-orange-800">kcal</span>
+                  </div>
+                </div>
+
+                {/* 運動模式切換 */}
+                <div className="flex bg-slate-200 p-1 rounded-xl mb-4">
+                  <button onClick={() => setExerciseInputMode('steps')} className={`flex-1 py-2 text-sm font-bold rounded-lg transition-colors ${exerciseInputMode === 'steps' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>步數</button>
+                  <button onClick={() => setExerciseInputMode('weightlifting')} className={`flex-1 py-2 text-sm font-bold rounded-lg transition-colors ${exerciseInputMode === 'weightlifting' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>重訓</button>
+                  <button onClick={() => setExerciseInputMode('custom')} className={`flex-1 py-2 text-sm font-bold rounded-lg transition-colors ${exerciseInputMode === 'custom' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>自訂</button>
+                </div>
+
+                <form onSubmit={handleAddExercise} className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm mb-6">
+                  <h3 className="font-bold text-slate-800 mb-4">新增運動紀錄</h3>
+                  <div className="space-y-4">
+                    {exerciseInputMode === 'steps' && (
+                      <div><label className="block text-xs text-slate-500 mb-1">今日步數</label><input name="stepsCount" type="number" className="w-full p-3.5 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-orange-500 font-medium" placeholder="例如: 10000" required /></div>
+                    )}
+                    {exerciseInputMode === 'weightlifting' && (
+                      <div><label className="block text-xs text-slate-500 mb-1">重訓時長 (分鐘)</label><input name="weightMins" type="number" className="w-full p-3.5 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-orange-500 font-medium" placeholder="例如: 45" required /></div>
+                    )}
+                    {exerciseInputMode === 'custom' && (
+                      <>
+                        <input name="exerciseName" type="text" className="w-full p-3.5 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-orange-500 font-medium" placeholder="輸入運動名稱 (例: 慢跑)" required />
+                        <input name="exerciseCals" type="number" className="w-full p-3.5 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-orange-500 font-medium" placeholder="消耗熱量 (kcal)" required />
+                      </>
+                    )}
+                    <button type="submit" className="w-full py-3.5 bg-slate-900 text-white font-bold rounded-xl active:scale-95 transition-transform shadow-md">
+                      寫入資料庫
+                    </button>
+                  </div>
+                </form>
+
+                {exerciseLogs.length > 0 && (
+                  <div className="space-y-3">
+                    {exerciseLogs.map(log => (
+                      <div key={log.id} className="bg-white p-4 rounded-xl border border-slate-100 flex justify-between items-center shadow-sm">
+                        <span className="font-bold text-slate-800">{log.name}</span>
+                        <div className="flex items-center gap-3">
+                          <span className="font-bold text-orange-600 bg-orange-50 px-2 py-1 rounded-lg">{log.calories} kcal</span>
+                          <button onClick={() => handleDeleteExercise(log.id)} className="text-slate-300 hover:text-red-500 transition-colors">×</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* 底部固定導航列 */}
+          <div className="absolute bottom-0 left-0 right-0 bg-white border-t border-slate-200 px-6 py-3 pb-6 flex justify-between items-center z-50">
+            <NavButton icon={Home} label="總覽" isActive={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} />
+            <NavButton icon={Camera} label="辨識" isActive={activeTab === 'food'} onClick={() => { setActiveTab('food'); setCurrentDate(getTodayString()); }} />
+            <NavButton icon={Droplets} label="飲水" isActive={activeTab === 'water'} onClick={() => setActiveTab('water')} />
+            <NavButton icon={Flame} label="運動" isActive={activeTab === 'exercise'} onClick={() => setActiveTab('exercise')} />
+            <NavButton icon={User} label="設定" isActive={activeTab === 'profile'} onClick={() => setActiveTab('profile')} />
+          </div>
+        </div>
+      );
+    }
+
+    // 導航按鈕元件
+    function NavButton({ icon: Icon, label, isActive, onClick }) {
+      return (
+        <button 
+          onClick={onClick} 
+          className={`flex flex-col items-center justify-center w-12 transition-colors ${isActive ? 'text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
+        >
+          <div className={`p-1.5 rounded-xl ${isActive ? 'bg-blue-50' : ''}`}>
+            <Icon className={`w-6 h-6 ${isActive ? 'fill-blue-100/50' : ''}`} />
+          </div>
+          <span className="text-[10px] font-bold mt-1 tracking-wide">{label}</span>
+        </button>
+      );
+    }
+
+    // 將 React 應用程式渲染至 DOM
+    const root = createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
